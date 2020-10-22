@@ -1,0 +1,1019 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Rekognition POC
+
+Parameters:
+
+  EnvName:
+    Type: String
+    Description: The environment name
+    AllowedValues:
+      - gamma
+      - beta
+      - prod
+
+  AppCode:
+    Type: String
+    Description: The application code
+
+  AvailabilityZone0:
+    Description: The first availability zone in the region
+    Type: AWS::EC2::AvailabilityZone::Name
+    ConstraintDescription: Must be a valid availability zone
+
+  AvailabilityZone1:
+    Description: The second availability zone in the region
+    Type: AWS::EC2::AvailabilityZone::Name
+    ConstraintDescription: Must be a valid availability zone
+
+  DynamoDbPrefixListId:
+    Description: The DynamoDb vpc prefix list id
+    Type: String
+
+  S3PrefixListId:
+    Description: The S3 VPC prefix list id
+    Type: String
+
+  LambdaBuildBucketName:
+    Description: The name of the Lambda build bucket - must be already created
+    Type: String
+
+  NewVideoQueueVisibility:
+    Description: The SQS visiblity for the new message queue
+    Type: Number
+
+  KmsKeyAlias:
+    Description: The KMS key alias
+    Type: String
+
+
+Mappings:
+
+  CidrMap:
+    Vpc:
+      Cidr: 10.50.0.0/16
+    Public0:
+      Cidr: 10.50.0.0/24
+    Public1:
+      Cidr: 10.50.1.0/24
+    Private0:
+      Cidr: 10.50.64.0/19
+    Private1:
+      Cidr: 10.50.96.0/19
+
+
+Resources:
+
+  # Step Functions #############################################################
+  #
+  #             "CreateImageDbEntry": {
+  #########          "Type": "Task",
+  #    "Resource": "arn:aws:states:::dynamodb:putItem",
+  #            "Parameters": {
+  #              "TableName": "${ImagesDynamoDbTable}"
+  #
+  #            }
+  #          },
+
+  FacesStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub faces-${AWS::StackName}
+      StateMachineType: STANDARD
+      DefinitionString: !Sub |
+        {
+          "Comment": "Faces State Machine",
+          "StartAt": "DetectFaces",
+          "States": {
+            "DetectFaces": {
+              "Type": "Task",
+              "Resource": "${DetectFacesLambda.Arn}",
+              "TimeoutSeconds": 500,
+              "End": true,
+              "Retry": [
+                {
+                "ErrorEquals": [
+                  "States.TaskFailed",
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.Unknown"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 16,
+                "BackoffRate": 2
+                }
+              ]
+            }
+          }
+        }
+      TracingConfiguration:
+        Enabled: true
+      RoleArn: !GetAtt FacesStateMachineRole.Arn
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+        - Key: AppCode
+          Value: !Ref AppCode
+
+  # Lambda #####################################################################
+
+  DetectFacesLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub detect-faces-${AWS::StackName}
+      Code:
+        S3Bucket: !Ref LambdaBuildBucketName
+        S3Key: detect-faces.zip
+      Description: !Sub Detect Faces ${AWS::StackName}
+      Handler: detect_faces.handler
+      MemorySize: 128
+      Role: !GetAtt DetectFacesLambdaRole.Arn
+      Runtime: python3.8
+      Timeout: 300
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          PERSON_TABLE: !Ref FacesDynamoDbTable
+          ENV_NAME: !Ref EnvName
+          APP_CODE: !Ref AppCode
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet0
+          - !Ref PrivateSubnet1
+        SecurityGroupIds:
+          - !GetAtt DetectFacesLambdaSecurityGroup.GroupId
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+        - Key: AppCode
+          Value: !Ref AppCode
+
+  FacesStateMachineStartLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub faces-state-start-${AWS::StackName}
+      Code:
+        S3Bucket: !Ref LambdaBuildBucketName
+        S3Key: faces-start.zip
+      Description: !Sub Faces SFN Start ${AWS::StackName}
+      Handler: faces_start.handler
+      MemorySize: 128
+      Role: !GetAtt FacesStateMachineStartRole.Arn
+      Runtime: python3.8
+      Timeout: 300
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref FacesStateMachine
+          ENV_NAME: !Ref EnvName
+          APP_CODE: !Ref AppCode
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet0
+          - !Ref PrivateSubnet1
+        SecurityGroupIds:
+          - !GetAtt FacesStateMachineStartLambdaSecurityGroup.GroupId
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+        - Key: AppCode
+          Value: !Ref AppCode
+
+  FacesStateMachineStartLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: true
+      BatchSize: 10
+      EventSourceArn: !GetAtt NewVideoQueue.Arn
+      FunctionName: !GetAtt FacesStateMachineStartLambda.Arn
+
+  # Messaging ##################################################################
+
+  NewVideoSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub New Video - ${AppCode}-${EnvName}
+      TopicName: !Sub new-video-${AppCode}-${EnvName}
+      KmsMasterKeyId: !Ref SystemKeyAlias
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+        - Key: AppCode
+          Value: !Ref AppCode
+
+  NewVideoSnsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: s3
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref NewVideoSnsTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:s3:::video-${AWS::AccountId}-${AWS::Region}-${AppCode}-${EnvName}
+      Topics:
+        - !Ref NewVideoSnsTopic
+
+  NewVideoSnsTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NewVideoSnsTopic
+      Endpoint: !GetAtt NewVideoQueue.Arn
+      Protocol: sqs
+      RawMessageDelivery: true
+
+  NewVideoQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub new-video-${AppCode}-${EnvName}
+      KmsMasterKeyId: !Ref SystemKeyAlias
+      VisibilityTimeout: !Ref NewVideoQueueVisibility
+      MessageRetentionPeriod:  1209600
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+        - Key: AppCode
+          Value: !Ref AppCode
+
+  NewVideoQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: sns-allow
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt NewVideoQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref NewVideoSnsTopic
+      Queues:
+        - !Ref NewVideoQueue
+
+  # Logging ####################################################################
+
+  FacesStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /app/${AWS::StackName}/faces-state-machine
+      RetentionInDays: 90
+
+  FacesStateMachineStartLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/faces-state-start-${AWS::StackName}
+      RetentionInDays: 90
+
+  # Encryption #################################################################
+
+  SystemKeyAlias:
+    Type: AWS::KMS::Alias
+    DeletionPolicy: Retain
+    Properties:
+      AliasName: !Sub alias/${KmsKeyAlias}-${AppCode}-${EnvName}
+      TargetKeyId: !GetAtt SystemKey.Arn
+
+  SystemKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    Properties:
+      Description: Key for system services
+      Enabled: true
+      EnableKeyRotation: true
+      KeyUsage: ENCRYPT_DECRYPT
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: system-key
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey*
+              - kms:CreateGrant
+              - kms:DescribeKey
+              - kms:ReEncrypt*
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - kms:Describe*
+              - kms:Get*
+              - kms:List*
+            Resource: '*'
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+        - Key: AppCode
+          Value: !Ref AppCode
+        - Key: SecurityLevel
+          Value: red
+
+  # EventBridge ################################################################
+
+  VideosS3WriteCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: !Sub video-s3-write-${AppCode}-${EnvName}
+      EventSelectors:
+        - DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub ${VideoBucket.Arn}/
+          IncludeManagementEvents: false
+          ReadWriteType: WriteOnly
+      IncludeGlobalServiceEvents: false
+      IsLogging: true
+      EnableLogFileValidation: true
+      S3BucketName: !Ref LogsBucket
+      S3KeyPrefix: cloudtrail/video-s3-write
+      IsMultiRegionTrail: false
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+        - Key: AppCode
+          Value: !Ref AppCode
+
+  # IAM #######################################################################
+
+  FacesStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub faces-state-machine-${AppCode}-${EnvName}
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: states.amazonaws.com
+      Policies:
+        - PolicyName: x-ray
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+        - PolicyName: cloudwatch-logs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies"
+                  - logs:DescribeLogGroups
+                Resource: '*'
+        - PolicyName: invoke-lambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt DetectFacesLambda.Arn
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+        - Key: AppCode
+          Value: !Ref AppCode
+
+  DetectFacesLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub detect-faces-lambda-${AppCode}-${EnvName}
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaENIManagementAccess
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+        - Key: AppCode
+          Value: !Ref AppCode
+
+  FacesStateMachineStartRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub faces-start-lambda-${AppCode}-${EnvName}
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+      Policies:
+        - PolicyName: sfn-start
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref FacesStateMachine
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${VideoBucket.Arn}/manifest/*
+              - Effect: Allow
+                Action:
+                  - sqs:DeleteMessage
+                  - sqs:ReceiveMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt NewVideoQueue.Arn
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt SystemKey.Arn
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaENIManagementAccess
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+        - Key: AppCode
+          Value: !Ref AppCode
+
+  # S3 #########################################################################
+
+  LambdaBuildBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LambdaBuildBucketName
+      PolicyDocument:
+        Statement:
+        - Sid: enforce-ssl
+          Effect: Deny
+          Principal: '*'
+          Action: s3:*
+          Resource:
+            - !Sub arn:aws:s3:::${LambdaBuildBucketName}
+            - !Sub arn:aws:s3:::${LambdaBuildBucketName}/*
+          Condition:
+            Bool:
+              aws:SecureTransport: false
+
+  VideoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub video-${AWS::AccountId}-${AWS::Region}-${AppCode}-${EnvName}
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LogsBucket
+        LogFilePrefix: s3/video/
+      VersioningConfiguration:
+        Status: Enabled # Enabled for deletion protection - images are immutable
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: s3:ObjectCreated:*
+            Topic: !Ref NewVideoSnsTopic
+            Filter:
+               S3Key:
+                 Rules:
+                   - Name: suffix
+                     Value: -manifest.json
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !GetAtt SystemKey.Arn
+              SSEAlgorithm: aws:kms
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+        - Key: AppCode
+          Value: !Ref AppCode
+
+  VideoBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref VideoBucket
+      PolicyDocument:
+        Statement:
+        - Sid: enforce-ssl
+          Effect: Deny
+          Principal: '*'
+          Action: s3:*
+          Resource:
+            - !Sub arn:aws:s3:::${VideoBucket}
+            - !Sub arn:aws:s3:::${VideoBucket}/*
+          Condition:
+            Bool:
+              aws:SecureTransport: false
+
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub logs-${AWS::AccountId}-${AWS::Region}-${AppCode}-${EnvName}
+      AccessControl: LogDeliveryWrite
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !GetAtt SystemKey.Arn
+              SSEAlgorithm: aws:kms
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-in-ten-years
+            Status: Enabled
+            ExpirationInDays: 3653
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+        - Key: AppCode
+          Value: !Ref AppCode
+
+  LogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogsBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: cloudtrail-check-acl
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt LogsBucket.Arn
+          - Sid: cloudtrail-write
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${LogsBucket.Arn}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+          - Sid: enforce-ssl
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub ${LogsBucket.Arn}
+              - !Sub ${LogsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # DB #########################################################################
+
+                #  ImagesDynamoDbTable:
+                #    Type: AWS::DynamoDB::Table
+                #    Properties:
+                #      TableName: !Sub ${AWS::StackName}-images
+                #      BillingMode: PAY_PER_REQUEST
+                #      PointInTimeRecoverySpecification:
+                #        PointInTimeRecoveryEnabled: true
+                #      AttributeDefinitions:
+                #      - AttributeName: id # Image id
+                #        AttributeType: S
+                #      KeySchema:
+                #      - AttributeName: id
+                #        KeyType: HASH
+                #      SSESpecification:
+                #        SSEType: KMS
+                #        SSEEnabled: true
+                #      TimeToLiveSpecification:
+                #        AttributeName:
+                #        Enabled: true
+                #      Tags:
+                #      - Key: EnvName
+                #        Value: !Ref EnvName
+                #      - Key: AppCode
+                #        Value: !Ref AppCode
+
+  FacesDynamoDbTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub faces-${AWS::StackName}
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: id # Faces id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      SSESpecification:
+        SSEType: KMS
+        SSEEnabled: true
+      Tags:
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+
+  # Security Groups ############################################################
+
+  StepFunctionsVpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub step-functions-vpc-endpoint-sg-${AWS::StackName}
+      GroupDescription: Step Functions Vpc Endpoint security group
+      VpcId: !Ref Vpc
+      Tags:
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+
+  StepFunctionsVpcEndpointSecurityGroupStartFacesIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt StepFunctionsVpcEndpointSecurityGroup.GroupId
+      SourceSecurityGroupId: !GetAtt FacesStateMachineStartLambdaSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+
+  RekognitionVpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub rekognition-vpc-endpoint-sg-${AWS::StackName}
+      GroupDescription: Rekognition Vpc Endpoint security group
+      VpcId: !Ref Vpc
+      Tags:
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+
+  RekognitionVpcEndpointSecurityGroupDetectFacesIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt RekognitionVpcEndpointSecurityGroup.GroupId
+      SourceSecurityGroupId: !GetAtt DetectFacesLambdaSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+
+  FacesStateMachineStartLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub faces-state-machine-start-lamba-sg-${AWS::StackName}
+      GroupDescription: Faces State Machine Start Lambda Security Group
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - DestinationSecurityGroupId: !GetAtt StepFunctionsVpcEndpointSecurityGroup.GroupId
+          IpProtocol: tcp
+          ToPort: 443
+          FromPort: 443
+        - DestinationPrefixListId: !Ref S3PrefixListId
+          IpProtocol: tcp
+          ToPort: 443
+          FromPort: 443
+      Tags:
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+
+  DetectFacesLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub detect-faces-lamba-sg-${AWS::StackName}
+      GroupDescription: Detect Faces Lambda Security Group
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - DestinationPrefixListId: !Ref DynamoDbPrefixListId
+          IpProtocol: tcp
+          ToPort: 443
+          FromPort: 443
+        - DestinationPrefixListId: !Ref S3PrefixListId
+          IpProtocol: tcp
+          ToPort: 443
+          FromPort: 443
+        - DestinationSecurityGroupId: !GetAtt RekognitionVpcEndpointSecurityGroup.GroupId
+          IpProtocol: tcp
+          ToPort: 443
+          FromPort: 443
+      Tags:
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+
+
+  # VPC Endpoints  #############################################################
+
+  RekognitionVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.rekognition
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet0
+        - !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !GetAtt RekognitionVpcEndpointSecurityGroup.GroupId
+
+  StepFunctionsVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.states
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet0
+        - !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !GetAtt StepFunctionsVpcEndpointSecurityGroup.GroupId
+
+  DynamoDbVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable0
+        - !Ref PrivateRouteTable1
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcId: !Ref Vpc
+
+  S3VpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable0
+        - !Ref PrivateRouteTable1
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcId: !Ref Vpc
+
+  # Network ####################################################################
+
+  NatEip0:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+    DependsOn: VpcGatewayAttachment
+
+  NatEip1:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+    DependsOn: VpcGatewayAttachment
+
+  NatGateway0:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip0.AllocationId
+      SubnetId: !Ref PublicSubnet0
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-nat-gw-0
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+    DependsOn: VpcGatewayAttachment
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-nat-gw-1
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+    DependsOn: VpcGatewayAttachment
+
+  NatRoute0:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable0
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway0
+    DependsOn: VpcGatewayAttachment
+
+  NatRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+    DependsOn: VpcGatewayAttachment
+
+  PrivateRouteTable0:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-0-rt
+        - Key: EnvName
+          Value: !Ref EnvName
+        - Key: AppCode
+          Value: !Ref AppCode
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-private-1-rt
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+
+  PrivateSubnetRouteTableAssociation0:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet0
+      RouteTableId: !Ref PrivateRouteTable0
+
+  PrivateSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [ CidrMap, Vpc, Cidr ]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+
+  PublicSubnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !FindInMap [ CidrMap, Public0, Cidr ]
+      AvailabilityZone: !Ref AvailabilityZone0
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-public-subnet-0
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !FindInMap [ CidrMap, Public1, Cidr ]
+      AvailabilityZone: !Ref AvailabilityZone1
+      Tags:
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-public-subnet-1
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+
+  PrivateSubnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !FindInMap [ CidrMap, Private0, Cidr ]
+      AvailabilityZone: !Ref AvailabilityZone0
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-private-subnet-0
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !FindInMap [ CidrMap, Private1, Cidr ]
+      AvailabilityZone: !Ref AvailabilityZone1
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-private-subnet-1
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-public-rt
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation0:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet0
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-igw
+      - Key: EnvName
+        Value: !Ref EnvName
+      - Key: AppCode
+        Value: !Ref AppCode
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
